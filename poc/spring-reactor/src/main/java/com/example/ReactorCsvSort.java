@@ -29,7 +29,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * load ALL rows into JVM heap before sorting.
  *
  * Usage:
- *   java -Xmx4g -jar reactor-csv-sort-1.0-SNAPSHOT.jar input.csv output.csv sort_column_index
+ *   java -Xmx4g -jar reactor-csv-sort-1.0-SNAPSHOT.jar input.csv output.csv sort_column_indices
+ *
+ * Supports multiple sort columns (comma-separated): 0,2,1
  *
  * Try different -Xmx values to see when it OOMs:
  *   java -Xmx2g  -jar ...   # Small heap
@@ -43,11 +45,12 @@ public class ReactorCsvSort {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 3) {
-            System.out.println("Usage: java -Xmx<size> -jar reactor-csv-sort.jar <input.csv> <output.csv> <sort_column_index>");
+            System.out.println("Usage: java -Xmx<size> -jar reactor-csv-sort.jar <input.csv> <output.csv> <sort_column_indices>");
             System.out.println();
             System.out.println("Examples:");
             System.out.println("  java -Xmx4g -jar reactor-csv-sort.jar data.csv sorted.csv 0");
             System.out.println("  java -Xmx8g -jar reactor-csv-sort.jar data.csv sorted.csv 2");
+            System.out.println("  java -Xmx8g -jar reactor-csv-sort.jar data.csv sorted.csv 0,2,1  # multi-column sort");
             System.out.println();
             System.out.println("To generate test data, use: --generate <output.csv> <rows> <columns>");
             System.out.println("  java -jar reactor-csv-sort.jar --generate test.csv 10000000 5");
@@ -61,13 +64,15 @@ public class ReactorCsvSort {
 
         String inputPath = args[0];
         String outputPath = args[1];
-        int sortColumnIndex = Integer.parseInt(args[2]);
+        int[] sortColumnIndices = Arrays.stream(args[2].split(","))
+                .mapToInt(Integer::parseInt)
+                .toArray();
 
         long fileSize = Files.size(Path.of(inputPath));
         System.out.println("=== Spring Reactor CSV Sort — Memory Test ===");
         System.out.println("Input file:    " + inputPath);
         System.out.println("File size:     " + formatBytes(fileSize));
-        System.out.println("Sort column:   " + sortColumnIndex);
+        System.out.println("Sort columns:  " + Arrays.toString(sortColumnIndices));
         System.out.println("Max heap (-Xmx): " + formatBytes(Runtime.getRuntime().maxMemory()));
         System.out.println();
 
@@ -77,7 +82,7 @@ public class ReactorCsvSort {
         Instant start = Instant.now();
 
         try {
-            sortCsvWithReactor(inputPath, outputPath, sortColumnIndex);
+            sortCsvWithReactor(inputPath, outputPath, sortColumnIndices);
         } catch (OutOfMemoryError e) {
             System.out.println();
             System.out.println("*** OUT OF MEMORY ***");
@@ -107,7 +112,7 @@ public class ReactorCsvSort {
         System.out.println("Spark Tungsten would use ~0.7-1.3x in off-heap binary + disk spill.");
     }
 
-    private static void sortCsvWithReactor(String inputPath, String outputPath, int sortColumnIndex) {
+    private static void sortCsvWithReactor(String inputPath, String outputPath, int[] sortColumnIndices) {
         AtomicLong rowCount = new AtomicLong(0);
 
         // Read CSV header
@@ -148,10 +153,7 @@ public class ReactorCsvSort {
             }
         })
         // ===== BLOCKING SORT — ALL ROWS IN MEMORY =====
-        .collectSortedList(Comparator.comparing(
-                (String[] row) -> sortColumnIndex < row.length ? row[sortColumnIndex] : "",
-                Comparator.naturalOrder()
-        ))
+        .collectSortedList(buildMultiColumnComparator(sortColumnIndices))
         .block(); // blocks until all rows collected and sorted
 
         updatePeakMemory();
@@ -168,6 +170,21 @@ public class ReactorCsvSort {
         }
 
         System.out.printf("Wrote %,d rows to %s%n", rowCount.get(), outputPath);
+    }
+
+    private static Comparator<String[]> buildMultiColumnComparator(int[] sortColumnIndices) {
+        Comparator<String[]> comparator = Comparator.comparing(
+                (String[] row) -> sortColumnIndices[0] < row.length ? row[sortColumnIndices[0]] : "",
+                Comparator.naturalOrder()
+        );
+        for (int i = 1; i < sortColumnIndices.length; i++) {
+            final int idx = sortColumnIndices[i];
+            comparator = comparator.thenComparing(
+                    (String[] row) -> idx < row.length ? row[idx] : "",
+                    Comparator.naturalOrder()
+            );
+        }
+        return comparator;
     }
 
     /**

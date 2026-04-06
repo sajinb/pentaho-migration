@@ -35,7 +35,9 @@ import static org.apache.spark.sql.functions.col;
  *        --add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
  *        --add-opens=java.base/java.util=ALL-UNNAMED \
  *        --add-opens=java.base/java.lang.invoke=ALL-UNNAMED \
- *        -jar spark-csv-sort-1.0-SNAPSHOT.jar input.csv output.csv sort_column_index
+ *        -jar spark-csv-sort-1.0-SNAPSHOT.jar input.csv output.csv sort_column_indices
+ *
+ * Supports multiple sort columns (comma-separated): 0,2,1
  *
  * Compare with ReactorCsvSort which needs 4-6x file size in JVM heap.
  */
@@ -46,11 +48,12 @@ public class SparkCsvSort {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 3) {
-            System.out.println("Usage: java -Xmx<size> -jar spark-csv-sort.jar <input.csv> <output.csv> <sort_column_index>");
+            System.out.println("Usage: java -Xmx<size> -jar spark-csv-sort.jar <input.csv> <output.csv> <sort_column_indices>");
             System.out.println();
             System.out.println("Examples:");
             System.out.println("  java -Xmx512m -jar spark-csv-sort.jar data.csv sorted.csv 0");
             System.out.println("  java -Xmx1g  -jar spark-csv-sort.jar data.csv sorted.csv 2");
+            System.out.println("  java -Xmx1g  -jar spark-csv-sort.jar data.csv sorted.csv 0,2,1  # multi-column sort");
             System.out.println();
             System.out.println("To generate test data, use: --generate <output.csv> <rows> <columns>");
             System.out.println("  java -jar spark-csv-sort.jar --generate test.csv 10000000 5");
@@ -66,13 +69,15 @@ public class SparkCsvSort {
 
         String inputPath = args[0];
         String outputPath = args[1];
-        int sortColumnIndex = Integer.parseInt(args[2]);
+        int[] sortColumnIndices = Arrays.stream(args[2].split(","))
+                .mapToInt(Integer::parseInt)
+                .toArray();
 
         long fileSize = Files.size(Path.of(inputPath));
         System.out.println("=== Apache Spark CSV Sort — Memory Test ===");
         System.out.println("Input file:    " + inputPath);
         System.out.println("File size:     " + formatBytes(fileSize));
-        System.out.println("Sort column:   " + sortColumnIndex);
+        System.out.println("Sort columns:  " + Arrays.toString(sortColumnIndices));
         System.out.println("Max heap (-Xmx): " + formatBytes(Runtime.getRuntime().maxMemory()));
         System.out.println();
 
@@ -82,7 +87,7 @@ public class SparkCsvSort {
         Instant start = Instant.now();
 
         try {
-            sortCsvWithSpark(inputPath, outputPath, sortColumnIndex);
+            sortCsvWithSpark(inputPath, outputPath, sortColumnIndices);
         } catch (OutOfMemoryError e) {
             System.out.println();
             System.out.println("*** OUT OF MEMORY ***");
@@ -111,7 +116,7 @@ public class SparkCsvSort {
         System.out.println("Reactor's collectSortedList() typically needs 4-6x (all in JVM heap, no spill).");
     }
 
-    private static void sortCsvWithSpark(String inputPath, String outputPath, int sortColumnIndex) {
+    private static void sortCsvWithSpark(String inputPath, String outputPath, int[] sortColumnIndices) {
         SparkSession spark = SparkSession.builder()
                 .appName("SparkCsvSort")
                 .master("local[*]")
@@ -131,16 +136,22 @@ public class SparkCsvSort {
                     .csv(inputPath);
 
             String[] columns = df.columns();
-            String sortColumn = columns[sortColumnIndex];
+            String[] sortColumns = Arrays.stream(sortColumnIndices)
+                    .mapToObj(i -> columns[i])
+                    .toArray(String[]::new);
             System.out.println("Header: " + Arrays.toString(columns));
-            System.out.println("Sorting by column: " + sortColumn);
+            System.out.println("Sorting by columns: " + Arrays.toString(sortColumns));
 
             long rowCount = df.count();
             updatePeakMemory();
             System.out.printf("Row count: %,d%n", rowCount);
 
             // Sort — Spark uses Tungsten off-heap + ExternalSorter with disk spill
-            Dataset<Row> sorted = df.orderBy(col(sortColumn));
+            // Build orderBy with multiple columns
+            org.apache.spark.sql.Column[] orderByCols = Arrays.stream(sortColumns)
+                    .map(org.apache.spark.sql.functions::col)
+                    .toArray(org.apache.spark.sql.Column[]::new);
+            Dataset<Row> sorted = df.orderBy(orderByCols);
 
             // Write as single CSV file
             String tempOutputDir = outputPath + "_spark_temp";

@@ -11,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 
@@ -25,7 +26,9 @@ import java.util.List;
  * No heavy runtime like Spark — just a lightweight Java library (~30 KB).
  *
  * Usage:
- *   java -Xmx256m -jar external-sort-csv-1.0-SNAPSHOT.jar input.csv output.csv sort_column_index
+ *   java -Xmx256m -jar external-sort-csv-1.0-SNAPSHOT.jar input.csv output.csv sort_column_indices
+ *
+ * Supports multiple sort columns (comma-separated): 0,2,1
  *
  * Compare with:
  *   - Spark:   Tungsten off-heap + ExternalSorter (0.3-1.0x file size in heap)
@@ -38,11 +41,12 @@ public class ExternalSortCsvSort {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 3) {
-            System.out.println("Usage: java -Xmx<size> -jar external-sort-csv.jar <input.csv> <output.csv> <sort_column_index>");
+            System.out.println("Usage: java -Xmx<size> -jar external-sort-csv.jar <input.csv> <output.csv> <sort_column_indices>");
             System.out.println();
             System.out.println("Examples:");
             System.out.println("  java -Xmx256m -jar external-sort-csv.jar data.csv sorted.csv 0");
             System.out.println("  java -Xmx512m -jar external-sort-csv.jar data.csv sorted.csv 2");
+            System.out.println("  java -Xmx512m -jar external-sort-csv.jar data.csv sorted.csv 0,2,1  # multi-column sort");
             System.out.println();
             System.out.println("To generate test data, use: --generate <output.csv> <rows> <columns>");
             System.out.println("  java -jar external-sort-csv.jar --generate test.csv 10000000 5");
@@ -56,13 +60,15 @@ public class ExternalSortCsvSort {
 
         String inputPath = args[0];
         String outputPath = args[1];
-        int sortColumnIndex = Integer.parseInt(args[2]);
+        int[] sortColumnIndices = Arrays.stream(args[2].split(","))
+                .mapToInt(Integer::parseInt)
+                .toArray();
 
         long fileSize = Files.size(Path.of(inputPath));
         System.out.println("=== External Merge Sort CSV Sort — Memory Test ===");
         System.out.println("Input file:    " + inputPath);
         System.out.println("File size:     " + formatBytes(fileSize));
-        System.out.println("Sort column:   " + sortColumnIndex);
+        System.out.println("Sort columns:  " + Arrays.toString(sortColumnIndices));
         System.out.println("Max heap (-Xmx): " + formatBytes(Runtime.getRuntime().maxMemory()));
         System.out.println();
 
@@ -72,7 +78,7 @@ public class ExternalSortCsvSort {
         Instant start = Instant.now();
 
         try {
-            sortCsvWithExternalSort(inputPath, outputPath, sortColumnIndex);
+            sortCsvWithExternalSort(inputPath, outputPath, sortColumnIndices);
         } catch (OutOfMemoryError e) {
             System.out.println();
             System.out.println("*** OUT OF MEMORY ***");
@@ -100,7 +106,7 @@ public class ExternalSortCsvSort {
         System.out.println("Reactor's collectSortedList() typically needs 4-6x (all in JVM heap, no spill).");
     }
 
-    private static void sortCsvWithExternalSort(String inputPath, String outputPath, int sortColumnIndex)
+    private static void sortCsvWithExternalSort(String inputPath, String outputPath, int[] sortColumnIndices)
             throws Exception {
 
         // Step 1: Read and display the CSV header
@@ -115,13 +121,18 @@ public class ExternalSortCsvSort {
         // Parse header to get column names (simple split — our generated data has no commas in values)
         headerColumns = headerLine.split(",");
 
-        if (sortColumnIndex < 0 || sortColumnIndex >= headerColumns.length) {
-            throw new IllegalArgumentException("Sort column index " + sortColumnIndex
-                    + " is out of range. File has " + headerColumns.length + " columns.");
+        for (int sortColumnIndex : sortColumnIndices) {
+            if (sortColumnIndex < 0 || sortColumnIndex >= headerColumns.length) {
+                throw new IllegalArgumentException("Sort column index " + sortColumnIndex
+                        + " is out of range. File has " + headerColumns.length + " columns.");
+            }
         }
 
         System.out.println("Header: " + String.join(", ", headerColumns));
-        System.out.println("Sorting by column: " + headerColumns[sortColumnIndex]);
+        String[] sortColumnNames = Arrays.stream(sortColumnIndices)
+                .mapToObj(i -> headerColumns[i])
+                .toArray(String[]::new);
+        System.out.println("Sorting by columns: " + String.join(", ", sortColumnNames));
 
         // Step 2: Create a headerless version of the input (external sort doesn't know about headers)
         Path headerlessInput = Files.createTempFile("external-sort-input-", ".csv");
@@ -140,11 +151,15 @@ public class ExternalSortCsvSort {
 
         updatePeakMemory();
 
-        // Step 3: Build a comparator that parses the CSV line and compares by the sort column
+        // Step 3: Build a comparator that compares by multiple sort columns in order
         Comparator<String> csvColumnComparator = (line1, line2) -> {
-            String val1 = extractCsvColumn(line1, sortColumnIndex);
-            String val2 = extractCsvColumn(line2, sortColumnIndex);
-            return val1.compareTo(val2);
+            for (int idx : sortColumnIndices) {
+                String val1 = extractCsvColumn(line1, idx);
+                String val2 = extractCsvColumn(line2, idx);
+                int cmp = val1.compareTo(val2);
+                if (cmp != 0) return cmp;
+            }
+            return 0;
         };
 
         // Step 4: Run external merge sort
